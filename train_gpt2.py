@@ -9,6 +9,10 @@ from torch.nn import functional as F
 from rich import print as rprint
 from hellaswag import render_example, iterate_examples
 
+def rotate_half_and_partially_negate(x):
+    x1 = x[..., :x.shape[-1] // 2]
+    x2 = x[..., x.shape[-1] // 2:]
+    return torch.cat((-x2, x1), dim=-1)
 
 class CausalSelfAttention(nn.Module):
 
@@ -21,7 +25,14 @@ class CausalSelfAttention(nn.Module):
         self.n_head = config.n_head
         self.n_embd = config.n_embd
         self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size)).                                      view(1, 1, config.block_size, config.block_size))
-        
+       
+        head_dim = config.n_embd // config.n_head
+        freq = 1.0 / (10000.0 ** (torch.arange(0, head_dim, 2).float() / head_dim))  # head_dim // 2
+        freq = torch.outer(torch.arange(config.block_size, dtype = torch.float32), freq)  # (block_size, head_dim // 2)
+        freq = torch.cat((freq, freq), dim=-1).view(1, 1, config.block_size, head_dim)  # (1, 1, block_size, head_dim)
+        self.register_buffer("cos", freq.cos(), persistent=False)
+        self.register_buffer("sin", freq.sin(), persistent=False)
+
     def forward(self, x):
         B, T, C = x.size()
 
@@ -30,6 +41,11 @@ class CausalSelfAttention(nn.Module):
         k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)  # (B, nh, T, hs)
         q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)  # (B, nh, T, hs)
         v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)  # (B, nh, T, hs)
+
+        cos = self.cos[:, :, :T, :]
+        sin = self.sin[:, :, :T, :]
+        q = (q * cos + rotate_half_and_partially_negate(q) * sin)
+        k = (k * cos + rotate_half_and_partially_negate(k) * sin)
 
         att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
         att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float("-inf"))
@@ -48,13 +64,12 @@ class MLP(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.c_fc    = nn.Linear(config.n_embd, 4 * config.n_embd)
-        self.gelu    = nn.GELU(approximate="tanh")
         self.c_proj  = nn.Linear(4 * config.n_embd, config.n_embd)
         self.c_proj.NANOGPT_SCALE_INIT = 1
 
     def forward(self, x):
         x = self.c_fc(x)
-        x = self.gelu(x)
+        x = F.relu(x).square()
         x = self.c_proj(x)
         return x
 
@@ -74,7 +89,7 @@ class Block(nn.Module):
 
 @dataclass
 class GPTConfig:
-        block_size: int = 64
+        block_size: int = 128
         vocab_size: int = 50257  # 50,000 BPE merges + 256 + 1 EOT
         n_layer: int = 12
         n_head: int = 6
@@ -88,7 +103,6 @@ class GPT(nn.Module):
 
         self.transformer = nn.ModuleDict(dict(
             wte = nn.Embedding(config.vocab_size, config.n_embd),
-            wpe = nn.Embedding(config.block_size, config.n_embd),
             h = nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
             ln_f = nn.LayerNorm(config.n_embd),
         ))
@@ -114,10 +128,7 @@ class GPT(nn.Module):
         B, T = idx.size()
         assert T <= self.config.block_size, f"{T=}, {self.config.block_size=}"
 
-        pos = torch.arange(0, T, dtype=torch.long, device=idx.device)  # T
-        pos_emb = self.transformer.wpe(pos)  # (T, n_embd)
-        tok_emb = self.transformer.wte(idx)  # (B, T, n_embd)
-        x = tok_emb + pos_emb  # (B, T, n_embd)
+        x = self.transformer.wte(idx)  # (B, T, n_embd)
 
         for block in self.transformer.h:
             x = block(x)  # (B, T, n_embd)
@@ -128,48 +139,6 @@ class GPT(nn.Module):
         if targets is not None:
             loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))
         return logits, loss
-
-    @classmethod
-    def from_pretrained(cls, model_type):
-
-        assert model_type in {"gpt2", "gpt2-medium", "gpt2-large", "gpt2-xl"}
-        from transformers import GPT2LMHeadModel
-        print("loading weights from pretrained gpt: %s" % model_type)
-        
-        config_args = {
-                "gpt2":        dict(n_layer=12, n_head=12, n_embd=768),
-                "gpt2-medium":  dict(n_layer=24, n_head=16, n_embd=1024),
-                "gpt2-large":   dict(n_layer=36, n_head=20, n_embd=1280),
-                "gpt2-xl":      dict(n_layer=48, n_head=25, n_embd=1600),
-        }[model_type]
-        config_args["vocab_size"] = 50257
-        config_args["block_size"] = 1024
-
-        config = GPTConfig(**config_args)
-        model = GPT(config)
-        sd = model.state_dict()
-        sd_keys = sd.keys()
-        sd_keys = [k for k in sd_keys if not k.endswith(".attn.bias")]
-
-        model_hf = GPT2LMHeadModel.from_pretrained(model_type)
-        sd_hf = model_hf.state_dict()
-
-        sd_keys_hf = sd_hf.keys()
-        sd_keys_hf = [k for k in sd_keys_hf if not k.endswith(".attn.masked_bias")]
-        sd_keys_hf = [k for k in sd_keys_hf if not k.endswith(".attn.bias")]
-        transposed = ["attn.c_attn.weight", "attn.c_proj.weight", "mlp.c_fc.weight", "mlp.c_proj.weight"]
-        
-        assert len(sd_keys_hf) == len(sd_keys), f"mismatched keys: {len(sd_keys_hf)} != {len(sd_keys)}"
-        for k in sd_keys_hf:
-            if any(k.endswith(w) for w in transposed):
-                assert sd_hf[k].shape[::-1] == sd[k].shape, f"{k=}"
-                with torch.no_grad():
-                    sd[k].copy_(sd_hf[k].t())
-            else:
-                assert sd_hf[k].shape == sd[k].shape, f"{k=}"
-                with torch.no_grad():
-                    sd[k].copy_(sd_hf[k])
-        return model 
 
     def configure_optimizers(self, weight_decay, learning_rate):
         param_dict = {pn: p for pn, p in self.named_parameters()}
@@ -242,19 +211,20 @@ def get_most_likely_row(tokens, mask, logits):
 
 
 torch.manual_seed(1337)
-model = GPT(GPTConfig(vocab_size=50304))
+model = GPT(GPTConfig(vocab_size=50257))
 model = torch.compile(model)
 enc = tiktoken.get_encoding("gpt2")
 
-total_batch_size = 1024 # 524288
-B = 4
+total_batch_size = 16384 # 524288
+B = 2
 T = GPTConfig().block_size
 assert total_batch_size % (B * T) == 0
 grad_accum_steps = total_batch_size // (B * T)
-rprint(f"{total_batch_size=}, {B*T=}, {total_batch_size*T}, {grad_accum_steps=}")
+rprint(f"{GPTConfig()=}")
+rprint(f"{total_batch_size=}, {B*T=}, {grad_accum_steps=}")
 
 
-max_lr = 4e-4
+max_lr = 1.2e-3
 min_lr = max_lr * 0.1
 warmup_steps = 50
 max_steps = 50000
@@ -298,7 +268,7 @@ for step in range(max_steps):
         grad_norm_lr_accum = 0.0
 
         t0 = time.time()
-        max_length = 16
+        max_length = GPTConfig().block_size
         tokens = enc.encode("Coriolis force is")
         tokens = torch.tensor(tokens, dtype=torch.long)
         tokens = tokens.unsqueeze(0)
