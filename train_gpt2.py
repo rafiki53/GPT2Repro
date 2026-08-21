@@ -87,9 +87,62 @@ class Block(nn.Module):
         x = x + self.mlp(self.ln_2(x))
         return x
 
+class CautiousAdamW(torch.optim.AdamW):
+
+    @torch.no_grad()
+    def step(self):
+        for group in self.param_groups:
+            for p in group['params']:
+                if p.grad is None:
+                    continue
+               
+                beta1, beta2 = group['betas']
+                state = self.state[p]
+                if len(state) == 0:
+                    state['step'] = 0
+                    state['exp_average'] = torch.zeros_like(p)
+                    state['exp_average_sq'] = torch.zeros_like(p)
+
+                state['step'] += 1
+                state['exp_average'].mul_(beta1).add_(p.grad, alpha = 1.0 - beta1)
+                state['exp_average_sq'].mul_(beta2).addcmul_(p.grad, p.grad, value = 1.0 - beta2)
+
+                corrected_rms = state['exp_average_sq'].sqrt() / (math.sqrt(1.0 - beta2 ** state['step']) + group['eps'])
+                update = state['exp_average'] / corrected_rms
+                p.add_(p * (update * p > 0), alpha = -group['lr'] * group['decay'])
+                p.add_(update, alpha=-group['lr'] * (1.0 - beta1 ** state['step']))
+
+# Define simple dummy tensors with gradients enabled
+param1 = torch.randn(2, 2, requires_grad=True)
+param2 = torch.randn(3, 3, requires_grad=True)
+param3 = torch.randn(4, 4, requires_grad=True)
+
+# 1. Compute a dummy loss using all parameters
+loss = (param1 ** 2).sum() + (param2 ** 2).sum() + (param3 ** 2).sum()
+
+# 2. Run backpropagation to generate loss gradients for each tensor
+loss.backward()
+
+# Set up parameter groups with custom hyperparameter overrides
+learning_rate = 1e-3
+optim_groups = [
+    {
+        "params": [param1, param2],
+        "decay": 0.01,
+    },
+    {
+        "params": [param3],
+        "decay": 0.0,
+    },
+]
+test_optimizer = CautiousAdamW(optim_groups, lr=learning_rate, betas=(0.9, 0.95), eps=1e-8)
+rprint(f"{test_optimizer=}")
+test_optimizer.step()
+
+
 @dataclass
 class GPTConfig:
-        block_size: int = 128
+        block_size: int = 64
         vocab_size: int = 50257  # 50,000 BPE merges + 256 + 1 EOT
         n_layer: int = 12
         n_head: int = 6
@@ -146,14 +199,15 @@ class GPT(nn.Module):
         decay_params = [p for n, p in param_dict.items() if p.dim() >= 2]
         nodecay_params = [p for n, p in param_dict.items() if p.dim() < 2]
         optim_groups = [
-                {'params': decay_params, 'weight_decay': weight_decay},
-                {'params': nodecay_params, 'weight_decay': 0.0}
+                {'params': decay_params, 'decay': weight_decay},
+                {'params': nodecay_params, 'decay': 0.0}
         ]
         num_decay_params = sum(p.numel() for p in decay_params)
         num_nodecay_params = sum(p.numel() for p in nodecay_params)
         rprint(f"{len(decay_params)=}, {num_decay_params=}")
         rprint(f"{len(nodecay_params)=}, {num_nodecay_params=}")
-        optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=(0.9, 0.95), eps=1e-8)
+        optimizer = CautiousAdamW(optim_groups, lr=learning_rate, betas=(0.9, 0.95), eps=1e-8)
+        #  optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=(0.9, 0.95), eps=1e-8)
         return optimizer
 
 
@@ -216,12 +270,12 @@ model = torch.compile(model)
 enc = tiktoken.get_encoding("gpt2")
 
 total_batch_size = 16384 # 524288
-B = 2
+B = 1
 T = GPTConfig().block_size
 assert total_batch_size % (B * T) == 0
 grad_accum_steps = total_batch_size // (B * T)
 rprint(f"{GPTConfig()=}")
-rprint(f"{total_batch_size=}, {B*T=}, {grad_accum_steps=}")
+rprint(f"{total_batch_size=}, {B=}, {B*T=}, {grad_accum_steps=}")
 
 
 max_lr = 1.2e-3
@@ -250,8 +304,9 @@ with open(log_file, "w") as f:
     pass
 
 grad_norm_lr_accum = 0.0
+total_tokens = 0
 for step in range(max_steps):
-    if step % 250 == 0:
+    if step % 250 == 0 and step > 0:
         t0 = time.time()
         model.eval()
         val_loader.load_shard(0)
@@ -268,13 +323,13 @@ for step in range(max_steps):
         grad_norm_lr_accum = 0.0
 
         t0 = time.time()
-        max_length = GPTConfig().block_size
+        max_len = 8 if step == 0 else 64
         tokens = enc.encode("Coriolis force is")
         tokens = torch.tensor(tokens, dtype=torch.long)
         tokens = tokens.unsqueeze(0)
         sample_rng = torch.Generator()
         sample_rng.manual_seed(42)
-        while tokens.size(1) < max_length:
+        while tokens.size(1) < max_len:
             with torch.no_grad():
                 logits, loss = model(tokens)  # (B, T, vocab_size)
                 logits = logits[:, -1, :]  # (B, vocab_size)
@@ -291,7 +346,7 @@ for step in range(max_steps):
         t0 = time.time()
         num_correct_norm = 0
         num_total = 0
-        for i, example in enumerate(iterate_examples("val", max_len = GPTConfig().block_size)):
+        for i, example in enumerate(iterate_examples("val", max_len = max_len)):
             _, tokens, mask, label = render_example(example)
             with torch.no_grad():
                 logits, loss = model(tokens)
@@ -330,8 +385,9 @@ for step in range(max_steps):
         param_group['lr'] = lr
     optimizer.step()
     tokens = train_loader.B * train_loader.T * grad_accum_steps
+    total_tokens += tokens
     t1 = time.time()
-    rprint(f"{step=}, {loss_accum/math.log(2)=:6.2f}, {lr=:.4e}, {norm=:.4f}, {step*tokens=}, {t1-t0=}, {tokens/(t1 - t0)=:6.2f}")
+    rprint(f"{step=}, {loss_accum/math.log(2)=:6.2f}, {lr=:.4e}, {norm=:.4f}, {total_tokens=}, {t1-t0=}, {tokens/(t1 - t0)=:6.2f}")
 
 import sys; sys.exit(0)
 
