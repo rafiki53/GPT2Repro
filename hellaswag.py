@@ -3,11 +3,12 @@ import json
 import requests
 import tiktoken
 from tqdm import tqdm
-import torch
-import torch.nn as nn
-from torch.nn import functional as F
-from transformers import GPT2LMHeadModel
 import math
+import jax
+import jax.numpy as jnp
+import numpy as np
+import optax
+
 
 DATA_CACHE_DIR = os.path.join(os.path.dirname(__file__), "hellaswag")
 
@@ -61,13 +62,13 @@ def render_example(example):
         data["ending_tokens"].append(end_tokens)
 
     max_len = max(len(row) for row in tok_rows)
-    tokens = torch.zeros((4, max_len), dtype=torch.long)
-    mask = torch.zeros((4, max_len), dtype=torch.long)
+    tokens = np.zeros((4, max_len), dtype=np.int32)
+    mask = np.zeros((4, max_len), dtype=np.int32)
     for i, (tok_row, mask_row) in enumerate(zip(tok_rows, mask_rows)):
-        tokens[i, :len(tok_row)] = torch.tensor(tok_row)
-        mask[i, :len(mask_row)] = torch.tensor(mask_row)
+        tokens[i, :len(tok_row)] = tok_row
+        mask[i, :len(mask_row)] = mask_row
 
-    return data, tokens, mask, label
+    return data, jnp.array(tokens), jnp.array(mask), label
 
 def iterate_examples(split, max_len = math.inf):
     download(split)
@@ -76,3 +77,17 @@ def iterate_examples(split, max_len = math.inf):
             example = json.loads(line)
             if len(enc.encode(example["ctx"])) + max([len(enc.encode(i)) for i in example["endings"]]) < max_len:
                 yield example
+
+def get_most_likely_row(
+    tokens: jax.Array, mask: jax.Array, logits: jax.Array
+) -> int:
+    shift_logits = logits[:, :-1, :]
+    shift_tokens = tokens[:, 1:]
+    shift_mask = mask[:, 1:]
+    shift_losses = optax.softmax_cross_entropy_with_integer_labels(
+        shift_logits, shift_tokens)
+    masked_shift_losses = shift_losses * shift_mask
+    sum_loss = jnp.sum(masked_shift_losses, axis=-1)
+    avg_loss = sum_loss / jnp.maximum(1.0, jnp.sum(shift_mask, axis=-1))
+    pred_norm = int(jnp.argmin(avg_loss))
+    return pred_norm
