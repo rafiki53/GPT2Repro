@@ -22,10 +22,7 @@ import tiktoken
 import hellaswag
 
 FLAGS = flags.FLAGS
-flags.DEFINE_string(
-    "data_root",
-    os.path.join(os.path.expanduser("~"), "edu_fineweb10B"),
-    "Directory containing the tokenized FineWebEdu shards.")
+flags.DEFINE_string("data_root","", "Directory containing the tokenized shards.")
 flags.DEFINE_string("checkpoint_dir", "", "Optional checkpoint path.")
 
 @dataclasses.dataclass
@@ -41,7 +38,7 @@ class Config:
     m: int = 4
     # in-memory batch size, i.e. the number of sequences actually processed in parallel
     # on the device
-    b: int = 4
+    b: int = 8
     # vocabulary size
     v: int = 50257
     # number of transformer layers
@@ -51,13 +48,13 @@ class Config:
     # save a checkpoint if step is divisible by this number
     save_interval_steps: int = 512
     # total number of tokens to train for
-    train_tokens: int = 2**24
+    train_tokens: int = 2**30
     # if <q, k> = 0 for all other keys and <q, k*> = this value, then the
     # attention softmax for k* will be 0.5. The attn_scale multiplied onto
     # attention scores is calculated from this value.
     attn_score_for_half_softmax: float = 0.45
     
-    # head dimesnsion equal to embedding dimension divided by the number of heads
+    # head dimension equal to embedding dimension divided by the number of heads
     h: int= dataclasses.field(init=False)# = 128  # c // n
     # number of 2D ROPE subspaces equal to half the head dimension
     r: int= dataclasses.field(init=False)# = 64  # h // 2
@@ -548,23 +545,23 @@ def main(argv: list[str]):
             decoded = enc.decode([int(t) for t in tokens[0, :max_gen_len]])
             rprint(f"{decoded=}")
 
-#            try:
-            num_correct_norm = 0
-            num_total = 0
-            for _, example in enumerate(
-                    hellaswag.iterate_examples("val", max_len=max_gen_len)
-            ):
-                _, ex_tokens, mask, label = hellaswag.render_example(example)
-                logits = model(ex_tokens)
-                pred_norm = hellaswag.get_most_likely_row(ex_tokens, mask, logits)
-                num_total += 1
-                num_correct_norm += int(pred_norm == label)
+            try:
+                num_correct_norm = 0
+                num_total = 0
+                for _, example in enumerate(
+                        hellaswag.iterate_examples("val", max_len=max_gen_len)
+                ):
+                    _, ex_tokens, mask, label = hellaswag.render_example(example)
+                    logits = model(ex_tokens)
+                    pred_norm = hellaswag.get_most_likely_row(ex_tokens, mask, logits)
+                    num_total += 1
+                    num_correct_norm += int(pred_norm == label)
 
-            if num_total > 0:
-                acc_norm = num_correct_norm/num_total
-                rprint(f"HellaSwag: {num_total=}, {acc_norm=:.4f}")
-#            except Exception as hellaswag_exception:
-#                rprint(f"{hellaswag_exception=}")
+                if num_total > 0:
+                    acc_norm = num_correct_norm/num_total
+                    rprint(f"HellaSwag: {num_total=}, {acc_norm=:.4f}")
+            except Exception as hellaswag_exception:
+                rprint(f"{hellaswag_exception=}")
 
         if ckpt_mgr:
             ckpt_mgr.save(

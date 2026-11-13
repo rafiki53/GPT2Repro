@@ -9,7 +9,6 @@ from datasets import DownloadConfig, load_dataset
 
 enc = tiktoken.get_encoding("gpt2")
 
-
 def render_example(example):
   ctx = example["ctx"]
   # Fix 1: HF stores label as a string ("0".."3"), whereas raw JSONL used an int
@@ -69,7 +68,6 @@ def iterate_examples(split, max_len=math.inf):
     max_end_len = max(len(enc.encode(" " + end)) for end in example["endings"])
     if ctx_len + max_end_len <= max_len:
       yield example
-
 
 def get_most_likely_row(
     tokens: jax.Array, mask: jax.Array, logits: jax.Array
