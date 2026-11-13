@@ -2,6 +2,8 @@ import dataclasses
 import io
 import math
 import os
+os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
+os.environ["XLA_PYTHON_CLIENT_ALLOCATOR"] = "cuda_async"
 import time
 
 from absl import app
@@ -39,7 +41,7 @@ class Config:
     m: int = 4
     # in-memory batch size, i.e. the number of sequences actually processed in parallel
     # on the device
-    b: int = 1
+    b: int = 4
     # vocabulary size
     v: int = 50257
     # number of transformer layers
@@ -54,39 +56,37 @@ class Config:
     # attention softmax for k* will be 0.5. The attn_scale multiplied onto
     # attention scores is calculated from this value.
     attn_score_for_half_softmax: float = 0.45
-
+    
     # head dimesnsion equal to embedding dimension divided by the number of heads
-    h: int = 128  # c // n
+    h: int= dataclasses.field(init=False)# = 128  # c // n
     # number of 2D ROPE subspaces equal to half the head dimension
-    r: int = 64  # h // 2
+    r: int= dataclasses.field(init=False)# = 64  # h // 2
     # bound for uniform matrix initialization
-    init_bound: float = 0.03125  # 3.0**0.5 * 0.5 * (c**-0.5)
+    init_bound: float= dataclasses.field(init=False)# = 0.03125  # 3.0**0.5 * 0.5 * (c**-0.5)
     # number of gradient accumulation steps (in-memory batches) per optimizer step
-    grad_accumulation_steps: int = 512
+    grad_accumulation_steps: int= dataclasses.field(init=False)# = 512
     # number of tokens processed per optimizer step
-    step_tokens: int = 2**19  # step_batch_size * t
+    step_tokens: int= dataclasses.field(init=False)# = 2**19  # step_batch_size * t
     # total number of optimizer steps
-    train_steps: int = 2**5  # train_tokens // step_tokens
+    train_steps: int= dataclasses.field(init=False)# = 2**5  # train_tokens // step_tokens
     # multiplied onto attention scores before the softmax
     # In "Attention is All You Need" this was 1 / h
-    attn_scale: float = 0.12033805218 # ln(t) / (h * attn_score_for_half_softmax)
+    attn_scale: float= dataclasses.field(init=False)# = 0.12033805218 # ln(t) / (h * attn_score_for_half_softmax)
+
 
     def __post_init__(self):
-        assert math.isclose(self.init_bound, 3.0**0.5 * 0.5 * (self.c**-0.5))
-        assert self.c % self.n == 0 and self.h == self.c // self.n
-        assert(
-            self.step_batch_size % self.b == 0
-            and self.grad_accumulation_steps == self.step_batch_size // self.b
-        )
-        assert self.step_tokens == self.step_batch_size * self.t
-        assert self.h % 2 == 0 and self.r == self.h // 2
-        assert self.train_steps == self.train_tokens // self.step_tokens
-        assert math.isclose(
-            self.attn_scale,
-            math.log(self.t) / (self.h * self.attn_score_for_half_softmax)
-        )
-
-
+        self.init_bound = 3.0**0.5 * 0.5 * (self.c**-0.5)
+        assert self.c % self.n == 0
+        self.h = self.c // self.n
+        assert self.step_batch_size % self.b == 0
+        self.grad_accumulation_steps = self.step_batch_size // self.b
+        
+        self.step_tokens = self.step_batch_size * self.t
+        assert self.h % 2 == 0
+        self.r = self.h // 2
+        self.train_steps = self.train_tokens // self.step_tokens
+        self.attn_scale=math.log(self.t) / (self.h * self.attn_score_for_half_softmax)
+        
 cfg = Config()
 rprint(cfg)
 
@@ -278,7 +278,7 @@ class Muon(nnx.Module):
         )
 
     def get_update(self, params: nnx.State, grads: nnx.State, step: int) -> nnx.State:
-        b1 = min(0.95, 0.85 + 0.00025 * step)
+        b1 = jnp.minimum(0.95, 0.85 + 0.00025 * step)
         self.momentum.set_value(
             jax.tree.map(
                 lambda m, g: b1 * m + (1.0 - b1) * g,
@@ -291,7 +291,7 @@ class Muon(nnx.Module):
             nesterov_update = b1 * m + (1.0 - b1) * g
             update = newton_shulz5(nesterov_update)
             cautious_wd_mask = (update * p) > 0
-            lr = p.max_lr * min(1.0, 2.0 - 2.0 * step / cfg.train_steps)
+            lr = p.max_lr * jnp.minimum(1.0, 2.0 - 2.0 * step / cfg.train_steps)
             p = p * (1.0 - lr * p.wd * cautious_wd_mask)
             return (p
                     - lr
@@ -338,7 +338,7 @@ class AdamW(nnx.Module):
         def update_p(p, m, v):
             update = (m / bias_c1) / (jnp.sqrt(v / bias_c2) + 1e-10)
             cautious_wd_mask = (update * p) > 0
-            lr = p.max_lr * min(1.0, 2.0 - 2.0 * step / cfg.train_steps)
+            lr = p.max_lr * jnp.minimum(1.0, 2.0 - 2.0 * step / cfg.train_steps)
             p = p * (1.0 - lr * p.wd * cautious_wd_mask)
             return p - lr * update
 
@@ -355,7 +355,8 @@ class AdamWAndMuon(nnx.Module):
     def __init__(self, model: nnx.Module):
         self.muon = Muon(model)
         self.adamw = AdamW(model)
-
+    
+    @nnx.jit
     def update(self, model: nnx.Module, grads: nnx.State, step: int):
         nnx.update(
             model,
@@ -417,7 +418,23 @@ def run_in_memory_batch(mdl: GPT, token_ids: jax.Array, targets: jax.Array):
             )
         )
     return nnx.value_and_grad(loss_fn)(mdl)
-
+    
+@nnx.jit
+def run_in_memory_and_combine_steps(mdl: GPT, token_ids: jax.Array, targets: jax.Array, accum_grads: GPT,train_loss:float):
+    loss, grads = run_in_memory_batch(mdl, token_ids, targets)
+    if accum_grads is None:
+        accum_grads = jax.tree.map(
+            lambda g: g / cfg.grad_accumulation_steps, grads
+        )
+    else:
+        accum_grads = jax.tree.map(
+            lambda a, g: a + (g /  cfg.grad_accumulation_steps),
+            accum_grads,
+            grads,
+        )
+    train_loss += loss / cfg.grad_accumulation_steps
+    return accum_grads,train_loss
+    
 def main(argv: list[str]):
     del argv  # Unused
 
@@ -455,7 +472,7 @@ def main(argv: list[str]):
             train_loader.current_pos = restored["loader"]["pos"]
             start_step = latest + 1
             rprint(f"{start_step=}")
-
+    rprint(f"Before any steps{jax.local_devices()[0].memory_stats()=}")
     next_x_train, next_y_train = None, None
     for step in range(start_step, cfg.train_steps + 1):
         t0 = time.time()
@@ -465,8 +482,9 @@ def main(argv: list[str]):
             assert next_x_train is None and next_y_train is None
             next_x_train, next_y_train = train_loader.next_batch()
         for i in range(cfg.grad_accumulation_steps):
-            loss, grads = run_in_memory_batch(model, next_x_train, next_y_train)
+            #loss, grads = run_in_memory_batch(model, next_x_train, next_y_train)
             # Don't load the next batch just before saving a checkpoint
+            accum_grads,train_loss = run_in_memory_and_combine_steps(model,next_x_train,next_y_train, accum_grads,train_loss) 
             if (
                 step % cfg.save_interval_steps == 0
                 and i == cfg.grad_accumulation_steps - 1
@@ -474,24 +492,30 @@ def main(argv: list[str]):
                 next_x_train, next_y_train = None, None
             else:
                 next_x_train, next_y_train = train_loader.next_batch()
-            if accum_grads is None:
-                accum_grads = jax.tree.map(
-                    lambda g: g / cfg.grad_accumulation_steps, grads
-                )
-            else:
-                accum_grads = jax.tree.map(
-                    lambda a, g: a + (g /  cfg.grad_accumulation_steps),
-                    accum_grads,
-                    grads,
-                )
-            train_loss += loss / cfg.grad_accumulation_steps
+                
+            #jax.block_until_ready(grads)
+            # if accum_grads is None:
+                # accum_grads = jax.tree.map(
+                    # lambda g: g / cfg.grad_accumulation_steps, grads
+                # )
+            # else:
+                # accum_grads = jax.tree.map(
+                    # lambda a, g: a + (g /  cfg.grad_accumulation_steps),
+                    # accum_grads,
+                    # grads,
+                # )
+            # train_loss += loss / cfg.grad_accumulation_steps
+            
         if step % 1 == 0:
             rprint(
                 f"{step=}, {train_loss/math.log(2)=:.4f} bits/token,"
                 f" {step*cfg.step_tokens=},"
                 f" {cfg.step_tokens/(time.time()-t0)=:.2f} tokens/s"
             )
-        optimizer.update(model, accum_grads, step)
+        
+        rprint(f"OPTIMIZER IS ABOUT TO RUN")
+        rprint(f"{jax.local_devices()[0].memory_stats()=}")
+        optimizer.update(model, accum_grads, jnp.asarray(step))
 
         if step % 1 == 0:
             t0 = time.time()
