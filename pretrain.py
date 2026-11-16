@@ -2,8 +2,6 @@ import dataclasses
 import io
 import math
 import os
-os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
-os.environ["XLA_PYTHON_CLIENT_ALLOCATOR"] = "cuda_async"
 import time
 
 from absl import app
@@ -20,6 +18,13 @@ from rich import print as rprint
 import tiktoken
 
 import hellaswag
+
+if not (os.environ.get("COLAB_TPU_ADDR") or os.environ.get("TPU_NAME")):
+    os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
+    os.environ["XLA_PYTHON_CLIENT_ALLOCATOR"] = "cuda_async"
+
+print(f"JAX default backend: {jax.default_backend()}")
+print(f"Available devices: {jax.devices()}")
 
 FLAGS = flags.FLAGS
 flags.DEFINE_string("data_root","", "Directory containing the tokenized shards.")
@@ -469,7 +474,7 @@ def main(argv: list[str]):
             train_loader.current_pos = restored["loader"]["pos"]
             start_step = latest + 1
             rprint(f"{start_step=}")
-    rprint(f"Before any steps{jax.local_devices()[0].memory_stats()=}")
+    rprint(f"Before any steps {jax.local_devices()[0].memory_stats()=}")
     next_x_train, next_y_train = None, None
     for step in range(start_step, cfg.train_steps + 1):
         t0 = time.time()
@@ -478,43 +483,27 @@ def main(argv: list[str]):
         if step % cfg.save_interval_steps == 1:
             assert next_x_train is None and next_y_train is None
             next_x_train, next_y_train = train_loader.next_batch()
-        for i in range(cfg.grad_accumulation_steps):
-            #loss, grads = run_in_memory_batch(model, next_x_train, next_y_train)
-            # Don't load the next batch just before saving a checkpoint
-            accum_grads,train_loss = run_in_memory_and_combine_steps(model,next_x_train,next_y_train, accum_grads,train_loss) 
-            if (
-                step % cfg.save_interval_steps == 0
-                and i == cfg.grad_accumulation_steps - 1
-            ):
-                next_x_train, next_y_train = None, None
-            else:
-                next_x_train, next_y_train = train_loader.next_batch()
-                
-            #jax.block_until_ready(grads)
-            # if accum_grads is None:
-                # accum_grads = jax.tree.map(
-                    # lambda g: g / cfg.grad_accumulation_steps, grads
-                # )
-            # else:
-                # accum_grads = jax.tree.map(
-                    # lambda a, g: a + (g /  cfg.grad_accumulation_steps),
-                    # accum_grads,
-                    # grads,
-                # )
-            # train_loss += loss / cfg.grad_accumulation_steps
+        with jax.profiler.trace("/tpu_trace", create_perfetto_link=True):
+            for i in range(cfg.grad_accumulation_steps):
+                accum_grads,train_loss = run_in_memory_and_combine_steps(model,next_x_train,next_y_train, accum_grads,train_loss) 
+                if (
+                    step % cfg.save_interval_steps == 0
+                    and i == cfg.grad_accumulation_steps - 1
+                ):
+                    next_x_train, next_y_train = None, None
+                else:
+                    next_x_train, next_y_train = train_loader.next_batch()
             
-        if step % 1 == 0:
+        
+            optimizer.update(model, accum_grads, jnp.asarray(step))
+        if step % 32 == 0:
             rprint(
                 f"{step=}, {train_loss/math.log(2)=:.4f} bits/token,"
                 f" {step*cfg.step_tokens=},"
                 f" {cfg.step_tokens/(time.time()-t0)=:.2f} tokens/s"
             )
-        
-        rprint(f"OPTIMIZER IS ABOUT TO RUN")
-        rprint(f"{jax.local_devices()[0].memory_stats()=}")
-        optimizer.update(model, accum_grads, jnp.asarray(step))
 
-        if step % 1 == 0:
+        if step % 256 == 0:
             t0 = time.time()
             if val_loader.shards:
                 val_loader.load_shard(0)
